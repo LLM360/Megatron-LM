@@ -43,6 +43,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.torch_norm import GroupRMSNorm
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -442,7 +443,14 @@ class TENorm:
                 "Please install it with `pip install transformer-engine`."
             )
 
-        if config.normalization == "LayerNorm":
+        if config.normalization == "RMSNorm" and config.layernorm_num_groups > 1:
+            instance = GroupRMSNorm(
+                hidden_size=hidden_size,
+                num_groups=config.layernorm_num_groups,
+                eps=eps,
+                sequence_parallel=config.sequence_parallel,
+            )
+        elif config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,

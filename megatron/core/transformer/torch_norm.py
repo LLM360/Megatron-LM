@@ -29,11 +29,23 @@ class WrappedTorchNorm:
 
         assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
-        assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
+        use_group_rmsnorm = config.normalization == "RMSNorm" and config.layernorm_num_groups > 1
+
+        assert (
+            not config.sequence_parallel or use_group_rmsnorm
+        ), f"sequence parallel not supported by torch LayerNorm"
 
         assert (
             not config.memory_efficient_layer_norm
         ), f"memory_efficient_layer_norm not supported by torch LayerNorm"
+
+        if use_group_rmsnorm:
+            return GroupRMSNorm(
+                hidden_size,
+                num_groups=config.layernorm_num_groups,
+                eps=eps,
+                sequence_parallel=config.sequence_parallel,
+            )
 
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
@@ -49,6 +61,44 @@ class WrappedTorchNorm:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
         return norm_cls(normalized_shape=hidden_size, eps=eps)
+
+
+class GroupRMSNorm(torch.nn.Module):
+    """RMSNorm applied independently to equal-sized hidden-dimension groups."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_groups: int,
+        eps: float = 1e-5,
+        sequence_parallel: bool = False,
+    ):
+        super().__init__()
+        if hidden_size % num_groups != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by num_groups ({num_groups})"
+            )
+        self.hidden_size = hidden_size
+        self.num_groups = num_groups
+        self.group_size = hidden_size // num_groups
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        setattr(self.weight, 'sequence_parallel', sequence_parallel)
+
+    def forward(self, x):
+        original_shape = x.shape
+        x = x.view(*original_shape[:-1], self.num_groups, self.group_size)
+        x_float = x.float()
+        rms = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x = (x_float * rms).to(dtype=self.weight.dtype)
+        x = x.view(original_shape)
+        return x * self.weight
+
+    def extra_repr(self):
+        return (
+            f"hidden_size={self.hidden_size}, num_groups={self.num_groups}, "
+            f"eps={self.eps}"
+        )
 
 
 class L2Norm(torch.nn.Module):

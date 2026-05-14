@@ -160,6 +160,9 @@ class TransformerConfig(ModelParallelConfig):
     """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
     numerical stability."""
 
+    layernorm_num_groups: int = 1
+    """Number of hidden-dimension groups for grouped RMSNorm. A value of 1 is standard RMSNorm."""
+
     add_bias_linear: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-bias-linear"]}}
     )
@@ -950,6 +953,22 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.kv_channels is None:
             self.kv_channels = self.hidden_size // self.num_attention_heads
+
+        if self.layernorm_num_groups < 1:
+            raise ValueError(
+                f"layernorm_num_groups must be >= 1, got {self.layernorm_num_groups}."
+            )
+        if self.layernorm_num_groups > 1:
+            if self.normalization != "RMSNorm":
+                raise ValueError(
+                    "Grouped normalization is only supported with RMSNorm, "
+                    f"but got {self.normalization}."
+                )
+            if self.hidden_size % self.layernorm_num_groups != 0:
+                raise ValueError(
+                    f"hidden_size ({self.hidden_size}) must be divisible by "
+                    f"layernorm_num_groups ({self.layernorm_num_groups})."
+                )
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
