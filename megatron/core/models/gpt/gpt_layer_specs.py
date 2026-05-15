@@ -185,6 +185,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     post_self_attn_layernorm: bool = False,
     post_mlp_layernorm: bool = False,
     fuse_layernorm_and_linear: bool = True,
+    remap_unfused_layernorm_checkpoint_keys: bool = True,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -200,6 +201,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        remap_unfused_layernorm_checkpoint_keys (bool, optional): Map separate unfused layernorm
+            module keys to fused TE checkpoint keys. Disable this for checkpoints that already
+            store separate layernorm modules, such as grouped RMSNorm xLLM checkpoints.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -295,7 +299,7 @@ def get_gpt_layer_with_transformer_engine_spec(
             "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
             "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
         }
-        if not fused_layernorm_linear:
+        if not fused_layernorm_linear and remap_unfused_layernorm_checkpoint_keys:
             sharded_state_dict_keys_map.update(
                 {
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
@@ -570,6 +574,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fuse_layernorm_and_linear=config.layernorm_num_groups == 1,
+            remap_unfused_layernorm_checkpoint_keys=config.layernorm_num_groups == 1,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -581,6 +586,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             fuse_layernorm_and_linear=config.layernorm_num_groups == 1,
+            remap_unfused_layernorm_checkpoint_keys=config.layernorm_num_groups == 1,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
