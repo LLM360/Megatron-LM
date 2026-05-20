@@ -198,6 +198,14 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    xllm_partial_rope_layout: bool = False
+    """Apply partial RoPE using xLLM's HF/SGLang head-dimension layout.
+
+    This is only intended for xLLM checkpoints where rotary_percent < 1.0;
+    standard Megatron partial RoPE rotates the first contiguous rotary slice,
+    while xLLM rotates the slice after converting to the xLLM head layout.
+    """
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""

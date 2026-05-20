@@ -1682,6 +1682,8 @@ def _add_network_size_args(parser):
                        help='Base to use for rotary positional embeddings, default 10000')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--xllm-partial-rope-layout', action='store_true',
+                       help='Use xLLM HF/SGLang head-dimension layout for partial RoPE.')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
