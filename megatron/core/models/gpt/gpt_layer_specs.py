@@ -184,6 +184,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     kitchen_attention_backend: str = "sdpa",
     post_self_attn_layernorm: bool = False,
     post_mlp_layernorm: bool = False,
+    fuse_layernorm_and_linear: bool = True,
+    remap_unfused_layernorm_checkpoint_keys: bool = True,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -199,6 +201,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        remap_unfused_layernorm_checkpoint_keys (bool, optional): Map separate unfused layernorm
+            module keys to fused TE checkpoint keys. Disable this for checkpoints that already
+            store separate layernorm modules, such as grouped RMSNorm xLLM checkpoints.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -213,7 +218,10 @@ def get_gpt_layer_with_transformer_engine_spec(
     if use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn),
+            fallback=TESpecProvider(
+                fallback_to_eager_attn=fallback_to_eager_attn,
+                fuse_layernorm_and_linear=fuse_layernorm_and_linear,
+            ),
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
         )
@@ -222,7 +230,10 @@ def get_gpt_layer_with_transformer_engine_spec(
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
-        backend = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
+        backend = TESpecProvider(
+            fallback_to_eager_attn=fallback_to_eager_attn,
+            fuse_layernorm_and_linear=fuse_layernorm_and_linear,
+        )
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -274,14 +285,36 @@ def get_gpt_layer_with_transformer_engine_spec(
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
+        fused_layernorm_linear = backend.fuse_layernorm_and_linear()
+        linear_qkv = (
+            backend.column_parallel_layer_norm_linear()
+            if fused_layernorm_linear
+            else backend.column_parallel_linear()
+        )
+        sharded_state_dict_keys_map = {
+            "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+            "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+            "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+            "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+            "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+            "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
+        }
+        if not fused_layernorm_linear and remap_unfused_layernorm_checkpoint_keys:
+            sharded_state_dict_keys_map.update(
+                {
+                    "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                    "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+                }
+            )
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
+                input_layernorm=IdentityOp if fused_layernorm_linear else backend.layer_norm(),
                 self_attention=ModuleSpec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
-                        linear_qkv=backend.column_parallel_layer_norm_linear(),
+                        linear_qkv=linear_qkv,
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
                         q_layernorm=(
@@ -293,19 +326,16 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                post_self_attn_layernorm=(
+                    backend.layer_norm() if post_self_attn_layernorm else IdentityOp
+                ),
+                pre_mlp_layernorm=(
+                    backend.layer_norm() if num_experts or not fused_layernorm_linear else IdentityOp
+                ),
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
-                sharded_state_dict_keys_map={
-                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-                },
+                post_mlp_layernorm=backend.layer_norm() if post_mlp_layernorm else IdentityOp,
+                sharded_state_dict_keys_map=sharded_state_dict_keys_map,
             ),
         )
 
@@ -543,6 +573,8 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fuse_layernorm_and_linear=config.layernorm_num_groups == 1,
+            remap_unfused_layernorm_checkpoint_keys=config.layernorm_num_groups == 1,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -553,6 +585,8 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            fuse_layernorm_and_linear=config.layernorm_num_groups == 1,
+            remap_unfused_layernorm_checkpoint_keys=config.layernorm_num_groups == 1,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(

@@ -89,12 +89,42 @@ def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
         return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
 
+def _xllm_layout_to_hf(t: Tensor) -> Tensor:
+    return t.reshape(*t.shape[:-1], -1, 2).transpose(-1, -2).reshape_as(t)
+
+
+def _hf_layout_to_xllm(t: Tensor) -> Tensor:
+    return t.reshape(*t.shape[:-1], 2, -1).transpose(-1, -2).reshape_as(t)
+
+
+def _apply_xllm_partial_rotary_pos_emb_bshd(
+    t: Tensor, freqs: Tensor, rotary_interleaved: bool = False, mscale: float = 1.0
+) -> Tensor:
+    rot_dim = freqs.shape[-1]
+    if rot_dim * 2 != t.shape[-1]:
+        raise ValueError(
+            "xLLM partial RoPE layout currently expects rope_head_dim * 2 == head_dim, "
+            f"got rope_head_dim={rot_dim}, head_dim={t.shape[-1]}"
+        )
+
+    x = _hf_layout_to_xllm(t)
+    x_rope, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+    x_rope_hf = _xllm_layout_to_hf(x_rope)
+
+    cos_ = (torch.cos(freqs) * mscale).to(x_rope_hf.dtype)
+    sin_ = (torch.sin(freqs) * mscale).to(x_rope_hf.dtype)
+    y_rope_hf = (x_rope_hf * cos_) + (_rotate_half(x_rope_hf, rotary_interleaved) * sin_)
+    y = torch.cat((_hf_layout_to_xllm(y_rope_hf), x_pass), dim=-1)
+    return _xllm_layout_to_hf(y)
+
+
 def _apply_rotary_pos_emb_bshd(
     t: Tensor,
     freqs: Tensor,
     rotary_interleaved: bool = False,
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
+    xllm_partial_rope_layout: bool = False,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
@@ -108,6 +138,12 @@ def _apply_rotary_pos_emb_bshd(
         Tensor: The input tensor after applying RoPE
     """
     rot_dim = freqs.shape[-1]
+    if xllm_partial_rope_layout and rot_dim < t.shape[-1]:
+        if multi_latent_attention:
+            raise ValueError("xLLM partial RoPE layout is not compatible with MLA tensors")
+        return _apply_xllm_partial_rotary_pos_emb_bshd(
+            t, freqs, rotary_interleaved=rotary_interleaved, mscale=mscale
+        )
 
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
@@ -183,6 +219,7 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    xllm_partial_rope_layout: bool = False,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -228,6 +265,7 @@ def _apply_rotary_pos_emb_thd(
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            xllm_partial_rope_layout=xllm_partial_rope_layout,
         ).squeeze(1)
     else:
         # CASE 2: Traditional mapping without offsets
@@ -244,6 +282,7 @@ def _apply_rotary_pos_emb_thd(
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            xllm_partial_rope_layout=xllm_partial_rope_layout,
         ).squeeze(1)
 
 
@@ -276,6 +315,8 @@ def apply_rotary_pos_emb(
                     "Please set apply_rope_fusion to false. This will become an error in v0.16."
                 )
                 use_unfused = True
+            if getattr(config, "xllm_partial_rope_layout", False):
+                use_unfused = True
             if mscale != 1.0:
                 warnings.warn(
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
@@ -286,10 +327,11 @@ def apply_rotary_pos_emb(
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
-            )
+            if not getattr(config, "xllm_partial_rope_layout", False):
+                assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb_thd(
+                    t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+                )
     # use unfused implementation
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
@@ -298,6 +340,7 @@ def apply_rotary_pos_emb(
             rotary_interleaved=config.rotary_interleaved,
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
+            xllm_partial_rope_layout=getattr(config, "xllm_partial_rope_layout", False),
         )
     else:
         return _apply_rotary_pos_emb_thd(
@@ -308,6 +351,7 @@ def apply_rotary_pos_emb(
             multi_latent_attention=config.multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
+            xllm_partial_rope_layout=getattr(config, "xllm_partial_rope_layout", False),
         )
 
 

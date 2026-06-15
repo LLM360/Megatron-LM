@@ -26,9 +26,12 @@ from megatron.core.utils import get_te_version, is_te_min_version
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def __init__(self, fallback_to_eager_attn: bool = False):
+    def __init__(
+        self, fallback_to_eager_attn: bool = False, fuse_layernorm_and_linear: bool = True
+    ):
         super().__init__()
         self.fallback_to_eager_attn = fallback_to_eager_attn
+        self._fuse_layernorm_and_linear = fuse_layernorm_and_linear
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -44,7 +47,7 @@ class TESpecProvider(BackendSpecProvider):
 
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
-        return True
+        return self._fuse_layernorm_and_linear
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""
