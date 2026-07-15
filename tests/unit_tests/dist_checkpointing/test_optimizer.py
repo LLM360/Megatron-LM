@@ -11,7 +11,13 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import (
+    LocalNonpersistentObject,
+    ShardedTensor,
+    load,
+    load_plain_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -24,7 +30,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer import ChainedOptimizer, DistributedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -345,6 +351,43 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_dp_reshardable_step_is_nonpersistent(self):
+        step = torch.tensor(1.0)
+        bucket_state = [
+            {
+                'param': torch.ones(2),
+                'exp_avg': torch.zeros(2),
+                'exp_avg_sq': torch.zeros(2),
+                'step': step,
+                'gbuf_local_start': 0,
+                'gbuf_local_end': 2,
+            }
+        ]
+        state = {
+            'per_bucket_numel': [2],
+            'per_bucket_numel_unpadded': [2],
+            0: {torch.float32: [bucket_state]},
+        }
+
+        optimizer = mock.Mock()
+        optimizer.data_parallel_group.rank.return_value = 0
+        optimizer.data_parallel_group.size.return_value = 1
+        optimizer.data_parallel_group_idx = 0
+        optimizer.distributed_optimizer_instance_id = 0
+        optimizer.gbuf_ranges = [None]
+        optimizer.get_parameter_state_dp_reshardable.return_value = state
+        bucket = mock.Mock(numel_unpadded=2)
+        bucket.grad_data.numel.return_value = 2
+        optimizer.buffers = [mock.Mock(buckets=[bucket])]
+
+        sharded_state = DistributedOptimizer.sharded_param_state_dp_reshardable(
+            optimizer, model_sharded_state_dict={}
+        )
+        sharded_step = sharded_state[0][torch.float32][0][0]['step']
+
+        assert isinstance(sharded_step, LocalNonpersistentObject)
+        assert sharded_step.unwrap() is step
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
