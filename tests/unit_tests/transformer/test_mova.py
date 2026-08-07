@@ -503,6 +503,33 @@ class TestMoVA:
         assert exact.hetereogenous_dist_checkpoint
         assert not exact.heterogeneous_block_specs
 
+    def test_dense_prefix_layout_is_preserved_with_virtual_pipeline_parallelism(self):
+        config = _small_config(
+            num_layers=48,
+            mova_num_dense_layers=3,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=4,
+            pipeline_dtype=torch.float32,
+        )
+
+        attention_modules = []
+        for vp_stage in range(config.virtual_pipeline_model_parallel_size):
+            for pp_rank in range(config.pipeline_model_parallel_size):
+                block_spec = get_mova_gpt_decoder_block_spec(
+                    config,
+                    use_transformer_engine=False,
+                    moe_grouped_gemm=False,
+                    vp_stage=vp_stage,
+                    pp_rank=pp_rank,
+                )
+                assert len(block_spec.layer_specs) == 6
+                attention_modules.extend(
+                    layer.submodules.self_attention.module for layer in block_spec.layer_specs
+                )
+
+        assert attention_modules[:3] == [SoftplusGatedSelfAttention] * 3
+        assert attention_modules[3:] == [MoVASelfAttention] * 45
+
     def test_xllm_bf16_router_gemm_precedes_fp32_scoring(self):
         config = _small_config(
             xllm_router_compatibility=True,
