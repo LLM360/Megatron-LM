@@ -187,8 +187,9 @@ class TestMoVA:
         yield
         Utils.destroy_model_parallel()
 
-    def test_group_rms_norm_forward_and_backward(self):
-        config = _small_config()
+    @pytest.mark.parametrize("use_torch_rms_norm", (False, True))
+    def test_group_rms_norm_forward_and_backward(self, use_torch_rms_norm):
+        config = _small_config(mova_use_torch_rms_norm=use_torch_rms_norm)
         norm = GroupRMSNorm(config, config.hidden_size, eps=1.0e-6).cuda()
         norm.weight.data.normal_(mean=0.0, std=0.1)
 
@@ -209,13 +210,15 @@ class TestMoVA:
         torch.testing.assert_close(hidden.grad, reference_hidden.grad)
         torch.testing.assert_close(norm.weight.grad, reference_weight.grad)
 
-    def test_group_rms_norm_rounds_offset_scale_in_bf16(self):
+    @pytest.mark.parametrize("use_torch_rms_norm", (False, True))
+    def test_group_rms_norm_rounds_offset_scale_in_bf16(self, use_torch_rms_norm):
         config = _small_config(
             hidden_size=4,
             num_attention_heads=1,
             num_query_groups=1,
             kv_channels=4,
             mova_norm_num_groups=1,
+            mova_use_torch_rms_norm=use_torch_rms_norm,
             params_dtype=torch.bfloat16,
         )
         norm = GroupRMSNorm(config, config.hidden_size, eps=1.0e-6).cuda()
@@ -656,6 +659,7 @@ def test_mova_cli_uses_native_dropout_defaults():
     defaults = parser.parse_args([])
     assert defaults.attention_dropout == 0.0
     assert defaults.hidden_dropout == 0.0
+    assert not defaults.mova_use_torch_rms_norm
     assert defaults.xllm_router_compatibility
     assert defaults.xllm_router_gemm_partitions == 1
 
@@ -668,6 +672,9 @@ def test_mova_cli_uses_native_dropout_defaults():
 
     partitioned = parser.parse_args(["--xllm-router-gemm-partitions", "2"])
     assert partitioned.xllm_router_gemm_partitions == 2
+
+    torch_rms_norm = parser.parse_args(["--mova-use-torch-rms-norm"])
+    assert torch_rms_norm.mova_use_torch_rms_norm
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="requires two distributed ranks")

@@ -42,6 +42,12 @@ def add_mova_args(parser):
         "--mova-value-backend", choices=("sequential", "grouped_gemm"), default="grouped_gemm"
     )
     group.add_argument(
+        "--mova-use-torch-rms-norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use PyTorch's native RMSNorm primitive for grouped normalization.",
+    )
+    group.add_argument(
         "--xllm-router-compatibility",
         action=argparse.BooleanOptionalAction,
         default=True,

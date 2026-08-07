@@ -89,6 +89,9 @@ class MoVATransformerConfig(TransformerConfig):
     mova_value_backend: str = "sequential"
     """Value expert backend: auditable sequential or fused grouped GEMM."""
 
+    mova_use_torch_rms_norm: bool = False
+    """Use PyTorch's native RMSNorm primitive for grouped normalization."""
+
     xllm_router_compatibility: bool = False
     """Match xLLM's BF16 router GEMM followed by FP32 scoring and top-k."""
 
@@ -177,7 +180,12 @@ class GroupRMSNorm(MegatronModule):
     def forward(self, hidden_states: Tensor) -> Tensor:
         input_dtype = hidden_states.dtype
         grouped = hidden_states.float().reshape(*hidden_states.shape[:-1], self.num_groups, -1)
-        grouped = grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + self.eps)
+        if self.config.mova_use_torch_rms_norm:
+            grouped = F.rms_norm(grouped, (self.group_size,), eps=self.eps)
+        else:
+            grouped = grouped * torch.rsqrt(
+                grouped.square().mean(dim=-1, keepdim=True) + self.eps
+            )
         normalized = grouped.reshape_as(hidden_states)
         # xLLM forms ``weight + 1`` in the activation dtype before its fused
         # kernel promotes the product.  Keeping that rounding point is needed
