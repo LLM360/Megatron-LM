@@ -3,6 +3,7 @@
 """Tests for strict, streaming xLLM MoVA Hugging Face checkpoint reads."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from megatron.core.models.gpt.mova_hf_checkpoint import (
     normalize_hf_xllm_mova_global_state,
     normalize_hf_xllm_mova_layer_state,
 )
+from tools.checkpoint.convert_xllm_mova import _apply_source_architecture
 
 
 def _hf_config() -> dict:
@@ -111,13 +113,19 @@ def _write_checkpoint(tmp_path, *, include_done: bool = True):
 
 def test_hf_config_translation_preserves_mova_architecture():
     source = hf_xllm_config_to_source_config(
-        _hf_config(), router_gemm_partitions=2, router_bias_update_rate=1.0e-3
+        _hf_config(),
+        router_gemm_partitions=2,
+        router_bias_update_rate=1.0e-3,
+        router_load_balancing_type="dot",
+        router_aux_loss_coeff=1.0e-4,
     )
     model = source["model"]
     assert source["seq_len"] == 128
     assert source["model_parallel_size"] == 2
     assert source["moe_router_load_balancing_type"] == "dot"
-    assert source["moe_aux_loss_coeff"] == 0.001
+    # The xLLM HF exporter currently writes its bridge default (0.001), not
+    # the native training value. Conversion must use the explicit source run.
+    assert source["moe_aux_loss_coeff"] == 1.0e-4
     assert (model["num_layers"], model["num_dense_layers"]) == (2, 1)
     assert (model["num_heads"], model["num_kv_heads"], model["head_dim"]) == (2, 1, 4)
     assert (model["num_values"], model["num_activated_values"]) == (2, 1)
@@ -125,12 +133,33 @@ def test_hf_config_translation_preserves_mova_architecture():
     assert model["moe_router_bias_update_rate"] == 1.0e-3
 
 
+def test_native_aux_loss_is_distributed_across_sparse_routers(tmp_path):
+    source = hf_xllm_config_to_source_config(
+        _hf_config(),
+        router_gemm_partitions=2,
+        router_bias_update_rate=1.0e-3,
+        router_load_balancing_type="dot",
+        router_aux_loss_coeff=1.0e-4,
+    )
+    args = SimpleNamespace(mcore_output=tmp_path)
+
+    _apply_source_architecture(args, source)
+
+    # One sparse layer contributes one MoVA and one FFN router loss.
+    assert args.moe_aux_loss_coeff == pytest.approx(5.0e-5)
+    assert args.mova_router_aux_loss_coeff == pytest.approx(5.0e-5)
+
+
 def test_hf_config_translation_rejects_unrepresented_forward_contract():
     config = _hf_config()
     config["use_sliding_window"] = True
     with pytest.raises(ValueError, match="use_sliding_window"):
         hf_xllm_config_to_source_config(
-            config, router_gemm_partitions=2, router_bias_update_rate=1.0e-3
+            config,
+            router_gemm_partitions=2,
+            router_bias_update_rate=1.0e-3,
+            router_load_balancing_type="dot",
+            router_aux_loss_coeff=1.0e-4,
         )
 
     config = _hf_config()
@@ -138,7 +167,11 @@ def test_hf_config_translation_rejects_unrepresented_forward_contract():
     config["mlp_only_layers"] = list(range(config["num_hidden_layers"]))
     with pytest.raises(ValueError, match="num_dense_layers"):
         hf_xllm_config_to_source_config(
-            config, router_gemm_partitions=2, router_bias_update_rate=1.0e-3
+            config,
+            router_gemm_partitions=2,
+            router_bias_update_rate=1.0e-3,
+            router_load_balancing_type="dot",
+            router_aux_loss_coeff=1.0e-4,
         )
 
 
@@ -151,14 +184,42 @@ def test_hf_config_translation_rejects_nonfinite_router_values(field, value):
     config[field] = value
     with pytest.raises(ValueError, match=field):
         hf_xllm_config_to_source_config(
-            config, router_gemm_partitions=2, router_bias_update_rate=1.0e-3
+            config,
+            router_gemm_partitions=2,
+            router_bias_update_rate=1.0e-3,
+            router_load_balancing_type="dot",
+            router_aux_loss_coeff=1.0e-4,
         )
 
 
 def test_hf_config_translation_rejects_nonfinite_bias_update_rate():
     with pytest.raises(ValueError, match="router_bias_update_rate"):
         hf_xllm_config_to_source_config(
-            _hf_config(), router_gemm_partitions=2, router_bias_update_rate=float("nan")
+            _hf_config(),
+            router_gemm_partitions=2,
+            router_bias_update_rate=float("nan"),
+            router_load_balancing_type="dot",
+            router_aux_loss_coeff=1.0e-4,
+        )
+
+
+@pytest.mark.parametrize(
+    ("balance_type", "aux_coeff", "match"),
+    (
+        ("global", 1.0e-4, "must be none or dot"),
+        (None, 1.0e-4, "must be zero"),
+        ("dot", 0.0, "must be positive"),
+        ("dot", float("nan"), "must be non-negative"),
+    ),
+)
+def test_hf_config_translation_validates_native_aux_loss(balance_type, aux_coeff, match):
+    with pytest.raises(ValueError, match=match):
+        hf_xllm_config_to_source_config(
+            _hf_config(),
+            router_gemm_partitions=2,
+            router_bias_update_rate=1.0e-3,
+            router_load_balancing_type=balance_type,
+            router_aux_loss_coeff=aux_coeff,
         )
 
 
@@ -220,7 +281,12 @@ def test_hf_checkpoint_reader_validates_index_and_streams_one_shard(tmp_path):
         sparse["layers.1.mova.router.bias"], state_1["model.layers.1.self_attn.v_router.bias"]
     )
     torch.testing.assert_close(sparse["output.final_norm.weight"], state_1["model.norm.weight"])
-    source_config = reader.source_config(router_gemm_partitions=2, router_bias_update_rate=1.0e-3)
+    source_config = reader.source_config(
+        router_gemm_partitions=2,
+        router_bias_update_rate=1.0e-3,
+        router_load_balancing_type="dot",
+        router_aux_loss_coeff=1.0e-4,
+    )
     assert source_config["model"]["vocab_size"] == config["vocab_size"]
 
 

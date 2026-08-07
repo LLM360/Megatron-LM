@@ -45,6 +45,18 @@ def add_hf_conversion_args(parser):
         required=True,
         help="Loss-free router-bias update rate used in the original xLLM run.",
     )
+    group.add_argument(
+        "--xllm-source-router-load-balancing-type",
+        choices=("none", "dot"),
+        required=True,
+        help="Router load-balancing objective used in the original xLLM run.",
+    )
+    group.add_argument(
+        "--xllm-source-router-aux-loss-coeff",
+        type=float,
+        required=True,
+        help="Router auxiliary-loss coefficient used in the original xLLM run.",
+    )
     return parser
 
 
@@ -54,6 +66,12 @@ def main() -> None:
     source_config = reader.source_config(
         router_gemm_partitions=parsed_args.xllm_source_router_gemm_partitions,
         router_bias_update_rate=parsed_args.xllm_source_router_bias_update_rate,
+        router_load_balancing_type=(
+            None
+            if parsed_args.xllm_source_router_load_balancing_type == "none"
+            else parsed_args.xllm_source_router_load_balancing_type
+        ),
+        router_aux_loss_coeff=parsed_args.xllm_source_router_aux_loss_coeff,
     )
     _apply_source_architecture(parsed_args, source_config)
     initialize_megatron(parsed_args=parsed_args)
@@ -78,7 +96,10 @@ def main() -> None:
         f"Converting complete HF export with xLLM reference {REFERENCE_XLLM_COMMIT}; "
         f"layers={reader.num_layers}, source_router_partitions="
         f"{args.xllm_router_gemm_partitions}, source_router_bias_update_rate="
-        f"{args.mova_router_bias_update_rate}"
+        f"{args.mova_router_bias_update_rate}, source_router_load_balancing_type="
+        f"{source_config['moe_router_load_balancing_type']}, "
+        f"source_router_aux_loss_coeff={source_config['moe_aux_loss_coeff']}, "
+        f"hf_bridge_router_aux_loss_coeff={reader.config['router_aux_loss_coef']}"
     )
     globals_loaded = False
     for layer_idx in range(reader.num_layers):

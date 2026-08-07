@@ -126,6 +126,8 @@ def validate_hf_xllm_mova_config(config: Mapping[str, Any]) -> None:
         or config["router_scaling_factor"] <= 0
     ):
         raise ValueError("router_scaling_factor must be positive")
+    # Schema-check the HF bridge coefficient, but do not use it as native
+    # training metadata; current xLLM exports populate it from a default.
     if (
         isinstance(config.get("router_aux_loss_coef"), bool)
         or not isinstance(config.get("router_aux_loss_coef"), (int, float))
@@ -136,9 +138,20 @@ def validate_hf_xllm_mova_config(config: Mapping[str, Any]) -> None:
 
 
 def hf_xllm_config_to_source_config(
-    config: Mapping[str, Any], *, router_gemm_partitions: int, router_bias_update_rate: float
+    config: Mapping[str, Any],
+    *,
+    router_gemm_partitions: int,
+    router_bias_update_rate: float,
+    router_load_balancing_type: str | None,
+    router_aux_loss_coeff: float,
 ) -> dict[str, Any]:
-    """Translate an HF export config into the normalized native-xLLM schema."""
+    """Translate an HF export config into the normalized native-xLLM schema.
+
+    The current xLLM exporter does not preserve native router-training
+    settings: its ``router_aux_loss_coef`` is an HF bridge default. Require
+    those settings from the source run, as we already do for router GEMM
+    partitions and the loss-free bias update rate.
+    """
 
     validate_hf_xllm_mova_config(config)
     hidden_size = config["hidden_size"]
@@ -156,13 +169,25 @@ def hf_xllm_config_to_source_config(
         or router_bias_update_rate <= 0
     ):
         raise ValueError("router_bias_update_rate must be positive")
+    if router_load_balancing_type not in (None, "dot"):
+        raise ValueError("router_load_balancing_type must be none or dot")
+    if (
+        isinstance(router_aux_loss_coeff, bool)
+        or not isinstance(router_aux_loss_coeff, (int, float))
+        or not math.isfinite(router_aux_loss_coeff)
+        or router_aux_loss_coeff < 0
+    ):
+        raise ValueError("router_aux_loss_coeff must be non-negative")
+    if router_load_balancing_type is None and router_aux_loss_coeff != 0:
+        raise ValueError("router_aux_loss_coeff must be zero when load balancing is disabled")
+    if router_load_balancing_type == "dot" and router_aux_loss_coeff == 0:
+        raise ValueError("router_aux_loss_coeff must be positive for dot load balancing")
 
-    aux_coeff = float(config["router_aux_loss_coef"])
     return {
         "seq_len": config["max_position_embeddings"],
         "model_parallel_size": router_gemm_partitions,
-        "moe_router_load_balancing_type": "dot" if aux_coeff else None,
-        "moe_aux_loss_coeff": aux_coeff,
+        "moe_router_load_balancing_type": router_load_balancing_type,
+        "moe_aux_loss_coeff": float(router_aux_loss_coeff),
         "model": {
             "arch": "transformer",
             "num_layers": config["num_hidden_layers"],
@@ -451,12 +476,19 @@ class HFXllmMoVACheckpoint:
         return self.config["num_hidden_layers"]
 
     def source_config(
-        self, *, router_gemm_partitions: int, router_bias_update_rate: float
+        self,
+        *,
+        router_gemm_partitions: int,
+        router_bias_update_rate: float,
+        router_load_balancing_type: str | None,
+        router_aux_loss_coeff: float,
     ) -> dict[str, Any]:
         return hf_xllm_config_to_source_config(
             self.config,
             router_gemm_partitions=router_gemm_partitions,
             router_bias_update_rate=router_bias_update_rate,
+            router_load_balancing_type=router_load_balancing_type,
+            router_aux_loss_coeff=router_aux_loss_coeff,
         )
 
     def layer_shard(self, layer_idx: int) -> str:
