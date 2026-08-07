@@ -316,11 +316,15 @@ class TopKRouter(Router):
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
-
+        # xLLM computes this objective independently on each context
+        # partition while still combining sequence-parallel token statistics
+        # across TP. Standard MCore retains the TP+CP objective.
+        xllm_compatibility = getattr(self.config, 'xllm_router_compatibility', False)
+        aux_loss_group = self.tp_group if xllm_compatibility else self.tp_cp_group
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=aux_loss_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -341,8 +345,9 @@ class TopKRouter(Router):
             aux_loss_coeff,
             aux_loss,
             "load_balancing_loss",
-            self.tp_cp_group,
+            aux_loss_group,
             valid_token_count=local_num_tokens,
+            avg_group=self.cp_group if xllm_compatibility else None,
         )
         return probs
 
@@ -456,6 +461,7 @@ class TopKRouter(Router):
         reduce_group: torch.distributed.ProcessGroup,
         reduce_group_has_dp: bool = False,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -486,6 +492,7 @@ class TopKRouter(Router):
             num_layers,
             reduce_group=reduce_group,
             reduce_group_has_dp=reduce_group_has_dp,
+            avg_group=avg_group,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.

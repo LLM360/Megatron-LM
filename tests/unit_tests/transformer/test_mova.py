@@ -917,3 +917,70 @@ def test_mova_cp2_packed_varlen_matches_single_rank_forward_and_backward():
         assert grad_rel_l2 < 3.0e-2
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="requires four distributed ranks")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_xllm_aux_loss_preserves_context_local_statistics():
+    """Match xLLM's CP-local objective while reconstructing TP token shards."""
+
+    try:
+        Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
+        config = _small_config(
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=True,
+            xllm_router_compatibility=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.7,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        router = TopKRouter(config=config, pg_collection=pg_collection).cuda()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        with torch.no_grad():
+            router.expert_bias.copy_(
+                torch.tensor([0.2, -0.1, 0.05, 0.0], device="cuda", dtype=torch.float32)
+            )
+
+        # Deliberately give the two CP ranks different expert distributions.
+        # A TP+CP-global auxiliary objective does not have this gradient.
+        base_logits = torch.tensor(
+            [
+                [[4.0, 2.0, -1.0, -2.0], [3.0, 1.0, 0.0, -1.0]],
+                [[2.0, 0.5, -0.5, -2.0], [1.0, 0.0, -1.0, -3.0]],
+            ],
+            device="cuda",
+        )
+        if cp_rank:
+            base_logits = base_logits.flip(-1) + torch.tensor(
+                [0.0, 0.3, -0.2, 0.1], device="cuda"
+            )
+        if tp_rank:
+            base_logits = base_logits.roll(1, dims=-1) - 0.15
+
+        logits = base_logits.detach().clone().requires_grad_(True)
+        routed_probs, _ = router.routing(logits)
+        routed_probs.sum().mul(0.0).backward()
+
+        tp_logits = [torch.empty_like(base_logits) for _ in range(2)]
+        torch.distributed.all_gather(tp_logits, base_logits.contiguous(), group=pg_collection.tp)
+        reference_logits = torch.cat(tp_logits, dim=0).requires_grad_(True)
+        sigmoid_scores = torch.sigmoid(reference_logits).view(-1, config.num_moe_experts)
+        normalized_scores = sigmoid_scores / sigmoid_scores.sum(dim=-1, keepdim=True)
+        selected = torch.topk(
+            sigmoid_scores + router.expert_bias, config.moe_router_topk, dim=-1
+        ).indices
+        routing_map = torch.zeros_like(sigmoid_scores).scatter(-1, selected, 1.0)
+        frequency = routing_map.mean(dim=0) / config.moe_router_topk
+        reference_loss = (
+            config.moe_aux_loss_coeff
+            * config.num_moe_experts
+            * torch.dot(frequency, normalized_scores.mean(dim=0))
+        )
+        reference_loss.backward()
+
+        expected_local_grad = reference_logits.grad.chunk(2, dim=0)[tp_rank]
+        torch.testing.assert_close(logits.grad, expected_local_grad, rtol=1.0e-5, atol=1.0e-7)
+    finally:
+        Utils.destroy_model_parallel()
