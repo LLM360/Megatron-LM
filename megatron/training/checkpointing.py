@@ -1367,6 +1367,7 @@ def load_args_from_checkpoint(
 
     checkpoint_args = state_dict['args']
     checkpoint_version = state_dict.get('checkpoint_version', 0)
+    is_mova_checkpoint = getattr(checkpoint_args, 'mova_num_value_experts', 0) > 0
     args.iteration = state_dict['iteration']
 
     # One-off conversion for foundation models
@@ -1416,6 +1417,8 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    if is_mova_checkpoint:
+        _set_arg('attention_output_gate', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
@@ -1429,13 +1432,42 @@ def load_args_from_checkpoint(
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
+    if is_mova_checkpoint:
+        _set_arg('moe_router_score_function', force=True)
+        _set_arg('moe_router_topk_scaling_factor', force=True)
+        _set_arg('moe_router_enable_expert_bias', force=True)
+        _set_arg('moe_router_bias_update_rate', force=True)
+        _set_arg('moe_router_dtype', force=True)
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
-    _set_arg('moe_grouped_gemm', force=True)
+    # The MoVA converter stages FFN experts in SequentialMLP because it has an
+    # auditable per-expert loading contract. Its distributed checkpoint is
+    # intentionally load-compatible with GroupedMLP, so keep the target backend
+    # as a launch-time choice. Preserve the established behavior for all other
+    # checkpoint families.
+    _set_arg('moe_grouped_gemm', force=not is_mova_checkpoint)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
+
+    # Mixture-of-Value Attention args. Do not probe these on ordinary GPT
+    # checkpoints: they do not own this architecture contract.
+    if is_mova_checkpoint:
+        _set_arg('mova_num_value_experts', force=True)
+        _set_arg('mova_router_topk', force=True)
+        _set_arg('mova_router_score_function', force=True)
+        _set_arg('mova_router_topk_scaling_factor', force=True)
+        _set_arg('mova_router_enable_expert_bias', force=True)
+        _set_arg('mova_router_bias_update_rate', force=True)
+        _set_arg('mova_router_aux_loss_coeff', force=True)
+        _set_arg('mova_router_load_balancing_type', force=True)
+        _set_arg('mova_num_dense_layers', force=True)
+        _set_arg('mova_norm_num_groups', force=True)
+        _set_arg('mova_attention_gate_function', force=True)
+        _set_arg('mova_value_backend', force=True)
+        _set_arg('xllm_router_compatibility', force=True)
+        _set_arg('xllm_router_gemm_partitions', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
