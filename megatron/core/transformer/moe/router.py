@@ -92,7 +92,37 @@ class Router(ABC, MegatronModule):
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
 
-        # Convert to specified datatype for routing computation if enabled
+        # xLLM performs the router GEMM in the activation dtype, rounds its
+        # output there, and only then converts logits to FP32 for scoring and
+        # top-k. Preserve that ordering for MoVA checkpoint continuation; a
+        # direct FP32 GEMM can change discrete expert choices near ties.
+        if getattr(self.config, 'xllm_router_compatibility', False):
+            if self.config.moe_router_dtype == 'fp64':
+                raise ValueError("xLLM router compatibility does not support fp64 routing")
+            partitions = getattr(self.config, 'xllm_router_gemm_partitions', 1)
+            if partitions == 1:
+                logits = router_gating_linear(input, self.weight, self.bias, input.dtype)
+                return logits.float()
+            if self.bias is not None:
+                raise ValueError("Partitioned xLLM router compatibility requires no linear bias")
+            if input.shape[-1] % partitions or self.weight.shape[-1] % partitions:
+                raise ValueError("Router hidden size must be divisible by GEMM partitions")
+
+            # xLLM row-shards each router over model parallel ranks. Every
+            # partial GEMM is rounded to BF16, converted to FP32, and then
+            # summed. Emulate that numerical contract locally so checkpoint
+            # continuation is independent of Megatron's target TP topology.
+            logits = None
+            for input_part, weight_part in zip(
+                input.chunk(partitions, dim=-1), self.weight.chunk(partitions, dim=-1)
+            ):
+                partial = router_gating_linear(
+                    input_part.contiguous(), weight_part.contiguous(), None, input.dtype
+                ).float()
+                logits = partial if logits is None else logits + partial
+            return logits
+
+        # Convert to specified datatype for routing computation if enabled.
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
             router_dtype = torch.float32
@@ -161,6 +191,9 @@ class TopKRouter(Router):
         self.input_jitter = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        # Keep this on the router itself. Hybrid architectures may contain
+        # routers with different expert counts and update rates.
+        self.expert_bias_update_rate = self.config.moe_router_bias_update_rate
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
@@ -605,6 +638,12 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
+            if getattr(self.config, 'xllm_router_compatibility', False):
+                # xLLM normalizes unbiased scores for its dot-product auxiliary
+                # loss, but counts the actual choices made with the loss-free
+                # selection bias. Keep standard MCore behavior unchanged for
+                # models that do not opt into xLLM checkpoint compatibility.
+                routing_map_for_aux_loss = routing_map
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,
