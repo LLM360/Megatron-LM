@@ -544,7 +544,9 @@ class MoVASelfAttention(Attention):
             bias=False,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name="qkg",
+            # QKG is the attention input column projection and therefore uses
+            # Transformer Engine's standard QKV sequence-parallel user buffer.
+            tp_comm_buffer_name="qkv",
             tp_group=pg_collection.tp,
         )
         self.value_projection = build_module(
