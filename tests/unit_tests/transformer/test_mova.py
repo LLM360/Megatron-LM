@@ -255,8 +255,9 @@ class TestMoVA:
         assert torch.count_nonzero(norm.weight) == 0
         assert norm.weight.sequence_parallel
 
-    def test_routed_value_projection_matches_reference(self):
-        config = _small_config()
+    @pytest.mark.parametrize("moe_router_fusion", (False, True))
+    def test_routed_value_projection_matches_reference(self, moe_router_fusion):
+        config = _small_config(moe_router_fusion=moe_router_fusion)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         value_projection = MoVAValueProjection(
             config=config,
@@ -681,8 +682,13 @@ class TestMoVATensorParallel:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("value_backend", ("sequential", "grouped_gemm"))
-    def test_routed_value_projection_tp2_matches_dense_reference(self, value_backend):
+    @pytest.mark.parametrize(
+        ("value_backend", "moe_router_fusion"),
+        (("sequential", False), ("grouped_gemm", False), ("grouped_gemm", True)),
+    )
+    def test_routed_value_projection_tp2_matches_dense_reference(
+        self, value_backend, moe_router_fusion
+    ):
         grouped = value_backend == "grouped_gemm"
         dtype = torch.bfloat16 if grouped else torch.float32
         config = _small_config(
@@ -690,6 +696,7 @@ class TestMoVATensorParallel:
             sequence_parallel=True,
             mova_router_enable_expert_bias=True,
             mova_value_backend=value_backend,
+            moe_router_fusion=moe_router_fusion,
             bf16=grouped,
             params_dtype=dtype,
             pipeline_dtype=dtype,
