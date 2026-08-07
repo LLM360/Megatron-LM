@@ -237,6 +237,24 @@ class TestMoVA:
 
         assert torch.equal(output, expected)
 
+    def test_group_rms_norm_supports_sharded_meta_initialization(self):
+        config = _small_config(
+            init_model_with_meta_device=True,
+            use_cpu_initialization=False,
+            sequence_parallel=True,
+            tensor_model_parallel_size=2,
+        )
+        with torch.device("meta"):
+            norm = GroupRMSNorm(config, config.hidden_size, eps=1.0e-6)
+
+        assert norm.weight.is_meta
+        norm.to_empty(device=torch.cuda.current_device())
+        norm.weight.data.fill_(1.0)
+        norm.reset_parameters()
+
+        assert torch.count_nonzero(norm.weight) == 0
+        assert norm.weight.sequence_parallel
+
     def test_routed_value_projection_matches_reference(self):
         config = _small_config()
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -342,6 +360,38 @@ class TestMoVA:
             torch.testing.assert_close(
                 grouped.weight.grad[expert_id], expert.weight.grad.T, rtol=2.0e-2, atol=2.0e-2
             )
+
+    def test_grouped_value_experts_support_sharded_meta_initialization(self):
+        config = _small_config(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            init_model_with_meta_device=True,
+            use_cpu_initialization=False,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        submodules = SequentialMoVAValueExpertsSubmodules(
+            linear=LocalSpecProvider().column_parallel_linear()
+        )
+        with torch.device("meta"):
+            experts = GroupedGemmMoVAValueExperts(
+                config=config,
+                submodules=submodules,
+                input_size=config.hidden_size,
+                output_size=config.num_query_groups * config.kv_channels,
+                num_experts=config.mova_num_value_experts,
+                pg_collection=pg_collection,
+            )
+
+        assert experts.weight.is_meta
+        experts.to_empty(device=torch.cuda.current_device())
+        model_parallel_cuda_manual_seed(4321)
+        experts.reset_parameters()
+
+        assert torch.isfinite(experts.weight).all()
+        assert torch.count_nonzero(experts.weight) > 0
+        assert experts.weight.tensor_model_parallel
+        assert experts.weight.partition_dim == 1
+        assert experts.weight.allreduce
 
     def test_attention_forward_matches_gqa_reference(self):
         config = _small_config()

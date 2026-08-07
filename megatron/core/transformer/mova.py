@@ -164,12 +164,15 @@ class GroupRMSNorm(MegatronModule):
         self.num_groups = config.mova_norm_num_groups
         self.group_size = hidden_size // self.num_groups
         self.eps = eps
-        self.weight = torch.nn.Parameter(
-            torch.zeros(hidden_size, dtype=config.params_dtype)
-            if config.perform_initialization
-            else torch.empty(hidden_size, dtype=config.params_dtype)
-        )
-        setattr(self.weight, "sequence_parallel", config.sequence_parallel)
+        self.weight = torch.nn.Parameter(torch.empty(hidden_size, dtype=config.params_dtype))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize the zero-centered scale, including after meta materialization."""
+        if self.config.perform_initialization and not self.weight.is_meta:
+            with torch.no_grad():
+                self.weight.zero_()
+        setattr(self.weight, "sequence_parallel", self.config.sequence_parallel)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         input_dtype = hidden_states.dtype
@@ -292,12 +295,17 @@ class GroupedGemmMoVAValueExperts(MegatronModule):
         self.input_size = input_size
         self.num_experts = num_experts
         self.output_size = output_size
-        tp_rank = get_pg_rank(self.tp_group)
-        tp_size = get_pg_size(self.tp_group)
-        self.input_size_per_partition = divide(input_size, tp_size)
-        self.output_size_per_partition = divide(output_size, tp_size)
+        self.tp_rank = get_pg_rank(self.tp_group)
+        self.tp_size = get_pg_size(self.tp_group)
+        self.input_size_per_partition = divide(input_size, self.tp_size)
+        self.output_size_per_partition = divide(output_size, self.tp_size)
 
-        device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
+        if config.init_model_with_meta_device:
+            device = "meta"
+        elif config.use_cpu_initialization:
+            device = "cpu"
+        else:
+            device = torch.cuda.current_device()
         self.weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -307,32 +315,44 @@ class GroupedGemmMoVAValueExperts(MegatronModule):
                 dtype=config.params_dtype,
             )
         )
-        set_tensor_model_parallel_attributes(self.weight, True, 1, 1)
-        if config.perform_initialization:
-            if config.use_cpu_initialization:
-                # Each stored expert is [input_per_tp, output]. Initialize its
-                # [output, input_per_tp] transpose like RowParallelLinear.
-                for expert_id in range(num_experts):
-                    expert_weight = self.weight.data[expert_id]
-                    _initialize_affine_weight_cpu(
-                        expert_weight.transpose(0, 1),
-                        output_size,
-                        input_size,
-                        self.input_size_per_partition,
-                        partition_dim=1,
-                        init_method=config.init_method,
-                        params_dtype=config.params_dtype,
-                        rank=tp_rank,
-                        world_size=tp_size,
-                        skip_set_tensor_parallel_attributes=True,
-                    )
-            else:
-                for expert_id in range(num_experts):
-                    expert_weight = self.weight.data[expert_id]
-                    _initialize_affine_weight_gpu(
-                        expert_weight.transpose(0, 1), config.init_method, partition_dim=1
-                    )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize TP-sharded experts, including after meta materialization."""
+        if not hasattr(self.weight, "tensor_model_parallel"):
+            set_tensor_model_parallel_attributes(self.weight, True, 1, 1)
         setattr(self.weight, "allreduce", True)
+
+        if not self.config.perform_initialization or self.weight.is_meta:
+            return
+
+        if self.weight.device.type == "cpu":
+            # Each stored expert is [input_per_tp, output]. Initialize its
+            # [output, input_per_tp] transpose like RowParallelLinear.
+            for expert_id in range(self.num_experts):
+                expert_weight = self.weight.data[expert_id]
+                _initialize_affine_weight_cpu(
+                    expert_weight.transpose(0, 1),
+                    self.output_size,
+                    self.input_size,
+                    self.input_size_per_partition,
+                    partition_dim=1,
+                    init_method=self.config.init_method,
+                    params_dtype=self.config.params_dtype,
+                    rank=self.tp_rank,
+                    world_size=self.tp_size,
+                    skip_set_tensor_parallel_attributes=True,
+                )
+        elif self.weight.device.type == "cuda":
+            for expert_id in range(self.num_experts):
+                expert_weight = self.weight.data[expert_id]
+                _initialize_affine_weight_gpu(
+                    expert_weight.transpose(0, 1),
+                    self.config.init_method,
+                    partition_dim=1,
+                )
+        else:
+            raise RuntimeError(f"Unsupported MoVA value-expert device: {self.weight.device}")
 
     def forward(self, permuted_tokens: Tensor, tokens_per_expert: Tensor) -> Tensor:
         if not self.config.bf16:
