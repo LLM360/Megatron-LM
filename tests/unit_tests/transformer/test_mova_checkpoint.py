@@ -319,6 +319,9 @@ def _mock_checkpoint_args(monkeypatch, checkpoint_args):
         use_tokenizer_model_from_checkpoint_args=False,
         use_mp_args_from_checkpoint_args=False,
         attention_output_gate=False,
+        norm_epsilon=1e-5,
+        moe_aux_loss_coeff=0.0,
+        moe_router_load_balancing_type="none",
         moe_router_score_function="softmax",
         moe_grouped_gemm=True,
         mova_num_value_experts=0,
@@ -329,6 +332,9 @@ def test_checkpoint_arg_loading_keeps_standard_checkpoint_behavior(monkeypatch):
     checkpoint_args = SimpleNamespace(
         mova_num_value_experts=0,
         attention_output_gate=True,
+        norm_epsilon=1e-6,
+        moe_aux_loss_coeff=1.25e-4,
+        moe_router_load_balancing_type="aux_loss",
         moe_router_score_function="sigmoid",
         moe_grouped_gemm=False,
     )
@@ -337,15 +343,21 @@ def test_checkpoint_arg_loading_keeps_standard_checkpoint_behavior(monkeypatch):
     loaded, _ = checkpointing.load_args_from_checkpoint(args)
 
     assert loaded.attention_output_gate is False
+    assert loaded.norm_epsilon == 1e-5
+    assert loaded.moe_aux_loss_coeff == 0.0
+    assert loaded.moe_router_load_balancing_type == "none"
     assert loaded.moe_router_score_function == "softmax"
     assert loaded.moe_grouped_gemm is False
 
 
-def test_checkpoint_arg_loading_preserves_mova_launch_backend(monkeypatch):
+def test_checkpoint_arg_loading_restores_mova_contract_and_preserves_launch_backend(monkeypatch):
     checkpoint_args = SimpleNamespace(
         num_experts=100,
         mova_num_value_experts=64,
         attention_output_gate=True,
+        norm_epsilon=1e-6,
+        moe_aux_loss_coeff=1.1111111111111112e-6,
+        moe_router_load_balancing_type="aux_loss",
         moe_router_score_function="sigmoid",
         moe_grouped_gemm=False,
     )
@@ -354,6 +366,9 @@ def test_checkpoint_arg_loading_preserves_mova_launch_backend(monkeypatch):
     loaded, _ = checkpointing.load_args_from_checkpoint(args)
 
     assert loaded.attention_output_gate is True
+    assert loaded.norm_epsilon == 1e-6
+    assert loaded.moe_aux_loss_coeff == 1.1111111111111112e-6
+    assert loaded.moe_router_load_balancing_type == "aux_loss"
     assert loaded.moe_router_score_function == "sigmoid"
     assert loaded.moe_grouped_gemm is True
     assert loaded.mova_num_value_experts == 64

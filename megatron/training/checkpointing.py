@@ -1419,6 +1419,7 @@ def load_args_from_checkpoint(
     _set_arg('hidden_dropout', force=True)
     if is_mova_checkpoint:
         _set_arg('attention_output_gate', force=True)
+        _set_arg('norm_epsilon', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
@@ -1433,6 +1434,12 @@ def load_args_from_checkpoint(
         setattr(args, 'moe_ffn_hidden_size', None)
     _set_arg('moe_router_topk', force=True)
     if is_mova_checkpoint:
+        # MoVA conversion records the native loss contract for both routed
+        # sublayers. Restore the FFN router settings alongside the value-router
+        # settings below so --use-checkpoint-args cannot silently disable or
+        # rescale one half of the source training objective.
+        _set_arg('moe_router_load_balancing_type', force=True)
+        _set_arg('moe_aux_loss_coeff', force=True)
         _set_arg('moe_router_score_function', force=True)
         _set_arg('moe_router_topk_scaling_factor', force=True)
         _set_arg('moe_router_enable_expert_bias', force=True)
