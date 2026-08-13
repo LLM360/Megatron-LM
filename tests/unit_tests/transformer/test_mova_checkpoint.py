@@ -346,7 +346,9 @@ def test_checkpoint_arg_loading_keeps_standard_checkpoint_behavior(monkeypatch):
     assert loaded.norm_epsilon == 1e-5
     assert loaded.moe_aux_loss_coeff == 0.0
     assert loaded.moe_router_load_balancing_type == "none"
-    assert loaded.moe_router_score_function == "softmax"
+    # Current production Megatron restores this standard MoE router setting
+    # from every checkpoint, independently of MoVA.
+    assert loaded.moe_router_score_function == "sigmoid"
     assert loaded.moe_grouped_gemm is False
 
 
