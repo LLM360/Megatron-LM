@@ -600,8 +600,15 @@ class TestMoVA:
         router.expert_bias.copy_(torch.tensor([0.0, 0.0, 0.0, 10.0], device="cuda"))
         captured = {}
 
-        def capture_aux_loss(self, probs, scores_for_aux_loss, routing_map):
-            del self, scores_for_aux_loss
+        def capture_aux_loss(
+            self,
+            probs,
+            scores_for_aux_loss,
+            routing_map,
+            *,
+            with_padding_mask=False,
+        ):
+            del self, scores_for_aux_loss, with_padding_mask
             captured["routing_map"] = routing_map.detach().clone()
             return probs
 
