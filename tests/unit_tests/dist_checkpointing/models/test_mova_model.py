@@ -2,6 +2,8 @@
 
 """Distributed-checkpoint resharding tests for MoVA GPT models."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,6 +13,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.mova_layer_specs import get_mova_gpt_decoder_block_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mova import MoVATransformerConfig
+from megatron.training.global_vars import get_args, set_args
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
@@ -78,8 +81,24 @@ def _initialize_mova_model(seed, backend, vocab_size=32, **config_overrides):
     )
 
 
+@pytest.fixture
+def checkpoint_global_args():
+    # The production MLP checkpoint merge consults this launch-time flag. The
+    # standalone distributed test does not run Megatron argument setup, so
+    # provide the same explicit default used by a normal training launch.
+    try:
+        previous_args = get_args()
+    except AssertionError:
+        previous_args = None
+    set_args(SimpleNamespace(low_memory_resume=False))
+    yield
+    set_args(previous_args)
+
+
 @pytest.mark.skipif(Utils.world_size < 8, reason="requires eight distributed ranks")
-def test_mova_checkpoint_reshards_tp_pp_ep_and_changes_ffn_backend(tmp_path_dist_ckpt):
+def test_mova_checkpoint_reshards_tp_pp_ep_and_changes_ffn_backend(
+    tmp_path_dist_ckpt, checkpoint_global_args
+):
     """Exercise the conversion topology and a representative production topology."""
 
     common_test_parallel_reconfiguration_e2e(
