@@ -205,7 +205,7 @@ class _FakeGroupedLinear(torch.nn.Module):
 
     def __init__(self, weight: torch.Tensor):
         super().__init__()
-        self.register_buffer("weight", weight)
+        self.weight = torch.nn.Parameter(weight.detach().clone())
 
     def forward(self, hidden_states, _tokens_per_expert):
         return torch.matmul(hidden_states, self.weight), None
@@ -221,8 +221,9 @@ def _fake_te_grouped_mlp(
         fp4=False,
         moe_apply_probs_on_input=False,
         use_te_activation_func=False,
-        bias_activation_fusion=False,
-        gated_linear_unit=False,
+        bias_activation_fusion=True,
+        gated_linear_unit=True,
+        activation_func_fp8_input_store=False,
     )
     experts.num_local_experts = 1
     experts.apply_router_probs_after_fc2 = apply_router_probs_after_fc2
@@ -235,46 +236,86 @@ def _fake_te_grouped_mlp(
     return experts
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_mova_post_fc2_router_probs_match_xllm_bf16_contract_and_preserve_dtype():
+def _swiglu_expert_reference(
+    hidden_states: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    routing_probs: torch.Tensor,
+    *,
+    apply_router_probs_after_fc2: bool,
+) -> torch.Tensor:
+    fc1_output = torch.matmul(hidden_states, weight1)
+    gate, linear = torch.chunk(fc1_output, 2, dim=-1)
+    activated = F.silu(gate) * linear
+    if not apply_router_probs_after_fc2:
+        activated = (activated * routing_probs.unsqueeze(-1)).to(activated.dtype)
+    output = torch.matmul(activated, weight2)
+    if apply_router_probs_after_fc2:
+        output = output * routing_probs.to(output.dtype).unsqueeze(-1)
+    return output
+
+
+def _run_fake_te_grouped_swiglu_contract(apply_router_probs_after_fc2: bool) -> torch.Tensor:
     torch.manual_seed(20260814)
-    hidden_states = torch.randn(11, 8, device="cuda", dtype=torch.bfloat16)
-    weight1 = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
-    weight2 = torch.randn(64, 8, device="cuda", dtype=torch.bfloat16)
-    routing_probs = torch.tensor(
+    hidden_seed = torch.randn(11, 8, device="cuda", dtype=torch.bfloat16)
+    weight1_seed = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16) * 0.1
+    weight2_seed = torch.randn(32, 8, device="cuda", dtype=torch.bfloat16) * 0.1
+    probs_seed = torch.tensor(
         [0.113, 0.227, 0.349, 0.461, 0.587, 0.613, 0.739, 0.811, 0.887, 0.941, 1.127],
         device="cuda",
         dtype=torch.float32,
     )
-    tokens_per_expert = torch.tensor([hidden_states.shape[0]], device="cuda")
+    tokens_per_expert = torch.tensor([hidden_seed.shape[0]], device="cuda")
 
-    fc1_output = torch.matmul(hidden_states, weight1)
-    activated = F.silu(fc1_output)
-    unweighted_down = torch.matmul(activated, weight2)
-    post_fc2_reference = unweighted_down * routing_probs.to(unweighted_down.dtype).unsqueeze(-1)
-    pre_fc2_reference = torch.matmul(
-        (activated * routing_probs.unsqueeze(-1)).to(activated.dtype), weight2
+    actual_hidden = hidden_seed.detach().clone().requires_grad_(True)
+    actual_probs = probs_seed.detach().clone().requires_grad_(True)
+    experts = _fake_te_grouped_mlp(
+        weight1_seed,
+        weight2_seed,
+        apply_router_probs_after_fc2=apply_router_probs_after_fc2,
+    )
+    actual_output, actual_bias = experts(actual_hidden, tokens_per_expert, actual_probs)
+
+    reference_hidden = hidden_seed.detach().clone().requires_grad_(True)
+    reference_probs = probs_seed.detach().clone().requires_grad_(True)
+    reference_weight1 = weight1_seed.detach().clone().requires_grad_(True)
+    reference_weight2 = weight2_seed.detach().clone().requires_grad_(True)
+    reference_output = _swiglu_expert_reference(
+        reference_hidden,
+        reference_weight1,
+        reference_weight2,
+        reference_probs,
+        apply_router_probs_after_fc2=apply_router_probs_after_fc2,
     )
 
-    post_fc2_experts = _fake_te_grouped_mlp(
-        weight1, weight2, apply_router_probs_after_fc2=True
-    )
-    post_fc2_output, post_fc2_bias = post_fc2_experts(
-        hidden_states, tokens_per_expert, routing_probs
-    )
-    assert post_fc2_bias is None
-    assert post_fc2_output.dtype == torch.bfloat16
-    torch.testing.assert_close(post_fc2_output, post_fc2_reference, rtol=0.0, atol=0.0)
+    assert actual_bias is None
+    assert actual_output.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_output, reference_output, rtol=2.0e-2, atol=2.0e-4)
 
-    default_experts = _fake_te_grouped_mlp(
-        weight1, weight2, apply_router_probs_after_fc2=False
+    output_grad = torch.randn_like(actual_output)
+    actual_output.backward(output_grad)
+    reference_output.backward(output_grad)
+    gradient_pairs = (
+        (actual_hidden.grad, reference_hidden.grad),
+        (actual_probs.grad, reference_probs.grad),
+        (experts.linear_fc1.weight.grad, reference_weight1.grad),
+        (experts.linear_fc2.weight.grad, reference_weight2.grad),
     )
-    default_output, default_bias = default_experts(
-        hidden_states, tokens_per_expert, routing_probs
-    )
-    assert default_bias is None
-    assert default_output.dtype == torch.bfloat16
-    torch.testing.assert_close(default_output, pre_fc2_reference, rtol=0.0, atol=0.0)
+    for actual_grad, reference_grad in gradient_pairs:
+        assert actual_grad is not None
+        assert reference_grad is not None
+        assert torch.isfinite(actual_grad).all()
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=2.0e-2, atol=2.0e-2)
+
+    return actual_output.detach()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_mova_post_fc2_router_probs_match_xllm_bf16_contract_and_preserve_dtype():
+    """Check gated SwiGLU forward/backward for both numerical contracts."""
+
+    post_fc2_output = _run_fake_te_grouped_swiglu_contract(True)
+    default_output = _run_fake_te_grouped_swiglu_contract(False)
     assert not torch.equal(post_fc2_output, default_output)
 
 
@@ -288,6 +329,91 @@ class TestMoVA:
         model_parallel_cuda_manual_seed(1234)
         yield
         Utils.destroy_model_parallel()
+
+    def test_te_grouped_swiglu_post_fc2_matches_bf16_etp1_reference_and_backward(self):
+        """Exercise the exact production expert backend and supported numerical scope."""
+
+        config = _small_config(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_dtype=torch.bfloat16,
+            use_cpu_initialization=False,
+            moe_grouped_gemm=True,
+            expert_tensor_parallel_size=1,
+            use_te_activation_func=False,
+            bias_activation_fusion=True,
+            activation_func_fp8_input_store=False,
+        )
+        block_spec = get_mova_gpt_decoder_block_spec(
+            config, use_transformer_engine=True, moe_grouped_gemm=True, pp_rank=0
+        )
+        expert_spec = (
+            block_spec.layer_specs[config.mova_num_dense_layers]
+            .submodules.mlp.submodules.experts
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        assert expert_spec.module is TEGroupedMLP
+        assert expert_spec.params["apply_router_probs_after_fc2"] is True
+        assert config.bf16 and config.params_dtype == torch.bfloat16
+        assert not config.fp8 and not config.fp4
+        assert config.gated_linear_unit and config.activation_func == F.silu
+        assert not config.use_te_activation_func
+        assert config.bias_activation_fusion and not config.add_bias_linear
+        assert pg_collection.expt_tp.size() == 1
+
+        experts = build_module(
+            expert_spec, 1, config, pg_collection=pg_collection
+        ).cuda()
+        assert experts.apply_router_probs_after_fc2
+        assert experts.tp_group.size() == 1
+
+        weight1 = experts.linear_fc1.weight0
+        weight2 = experts.linear_fc2.weight0
+        torch.manual_seed(20260814)
+        with torch.no_grad():
+            weight1.copy_(torch.randn_like(weight1) * 0.05)
+            weight2.copy_(torch.randn_like(weight2) * 0.05)
+
+        hidden_seed = torch.randn(13, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        probs_seed = torch.linspace(0.15, 1.05, 13, device="cuda", dtype=torch.float32)
+        actual_hidden = hidden_seed.detach().clone().requires_grad_(True)
+        actual_probs = probs_seed.detach().clone().requires_grad_(True)
+        tokens_per_expert = torch.tensor([hidden_seed.shape[0]], device="cuda")
+        actual_output, actual_bias = experts(actual_hidden, tokens_per_expert, actual_probs)
+
+        reference_hidden = hidden_seed.detach().clone().requires_grad_(True)
+        reference_probs = probs_seed.detach().clone().requires_grad_(True)
+        reference_weight1 = weight1.detach().clone().requires_grad_(True)
+        reference_weight2 = weight2.detach().clone().requires_grad_(True)
+        fc1_reference = F.linear(reference_hidden, reference_weight1)
+        gate, linear = torch.chunk(fc1_reference, 2, dim=-1)
+        activated_reference = F.silu(gate) * linear
+        down_reference = F.linear(activated_reference, reference_weight2)
+        reference_output = down_reference * reference_probs.to(down_reference.dtype).unsqueeze(-1)
+
+        assert actual_bias is None
+        assert actual_output.dtype == torch.bfloat16
+        torch.testing.assert_close(actual_output, reference_output, rtol=2.0e-2, atol=2.0e-2)
+
+        output_grad = torch.randn_like(actual_output)
+        actual_output.backward(output_grad)
+        reference_output.backward(output_grad)
+        gradient_pairs = {
+            "input": (actual_hidden.grad, reference_hidden.grad, torch.bfloat16),
+            "router probabilities": (actual_probs.grad, reference_probs.grad, torch.float32),
+            "fc1 weight": (weight1.grad, reference_weight1.grad, torch.bfloat16),
+            "fc2 weight": (weight2.grad, reference_weight2.grad, torch.bfloat16),
+        }
+        for name, (actual_grad, reference_grad, expected_dtype) in gradient_pairs.items():
+            assert actual_grad is not None, f"missing {name} gradient"
+            assert reference_grad is not None, f"missing reference {name} gradient"
+            assert actual_grad.dtype == expected_dtype
+            assert torch.isfinite(actual_grad).all()
+            torch.testing.assert_close(
+                actual_grad, reference_grad, rtol=3.0e-2, atol=3.0e-2, msg=name
+            )
 
     @pytest.mark.parametrize("use_torch_rms_norm", (False, True))
     def test_group_rms_norm_forward_and_backward(self, use_torch_rms_norm):

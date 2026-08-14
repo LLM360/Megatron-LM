@@ -555,6 +555,34 @@ class TEGroupedMLP(MegatronModule):
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
+        if self.apply_router_probs_after_fc2:
+            # This opt-in matches the current xLLM MoVA production path. Validate new
+            # numerical formats and distributed layouts before extending its scope.
+            if (
+                not self.config.bf16
+                or self.config.params_dtype != torch.bfloat16
+                or self.config.fp8
+                or self.config.fp4
+            ):
+                raise ValueError(
+                    "Post-fc2 router probabilities are currently validated only for BF16 experts."
+                )
+            if self.config.add_bias_linear:
+                raise ValueError(
+                    "Post-fc2 router probabilities are currently validated only for "
+                    "bias-free experts."
+                )
+            if not self.config.gated_linear_unit or self.config.activation_func != F.silu:
+                raise ValueError(
+                    "Post-fc2 router probabilities are currently validated only for "
+                    "gated SwiGLU experts."
+                )
+            if self.tp_group.size() != 1:
+                raise ValueError(
+                    "Post-fc2 router probabilities are currently validated only with "
+                    "expert tensor parallel size 1."
+                )
+
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
