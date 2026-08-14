@@ -539,10 +539,15 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        apply_router_probs_after_fc2: bool = False,
     ):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        # xLLM's MoVA experts apply each routing probability to the completed
+        # expert output. Keep Megatron's existing activation-side weighting as
+        # the default for every other model and expert specification.
+        self.apply_router_probs_after_fc2 = apply_router_probs_after_fc2
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -672,6 +677,10 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = permuted_probs.unsqueeze(-1)
 
         if self.config.moe_apply_probs_on_input:
+            assert not self.apply_router_probs_after_fc2, (
+                "`moe_apply_probs_on_input` and `apply_router_probs_after_fc2` "
+                "cannot be enabled together."
+            )
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
@@ -680,6 +689,12 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
+
+        activation_probs = (
+            torch.ones_like(permuted_probs)
+            if self.apply_router_probs_after_fc2
+            else permuted_probs
+        )
 
         with off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
@@ -756,11 +771,11 @@ class TEGroupedMLP(MegatronModule):
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+                    bias_act_func, fc1_output, bias_parallel, activation_probs
                 )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+                bias_act_output = bias_act_func(fc1_output, bias_parallel, activation_probs)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
@@ -772,7 +787,10 @@ class TEGroupedMLP(MegatronModule):
             output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        output = self._apply_bias(output, output_bias, tokens_per_expert, activation_probs)
+        if self.apply_router_probs_after_fc2:
+            output_dtype = output.dtype
+            output = output * permuted_probs.to(output_dtype)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:

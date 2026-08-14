@@ -12,8 +12,10 @@ import torch.nn.functional as F
 import transformer_engine_torch as tex
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.models.gpt.mova_layer_specs import (
     get_k2mova_36b_config,
     get_mova_gpt_decoder_block_spec,
@@ -21,6 +23,7 @@ from megatron.core.models.gpt.mova_layer_specs import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.mova import (
     GroupedGemmMoVAValueExperts,
@@ -174,6 +177,105 @@ def test_mova_builder_rejects_unimplemented_mtp_composition():
     args = SimpleNamespace(use_legacy_models=False, yaml_cfg=None, spec=None, mtp_num_layers=1)
     with pytest.raises(ValueError, match="does not currently support MTP"):
         mova_builder(args, pre_process=True, post_process=True)
+
+
+def test_only_mova_te_grouped_experts_enable_post_fc2_router_probs():
+    config = _small_config()
+    block_spec = get_mova_gpt_decoder_block_spec(
+        config, use_transformer_engine=True, moe_grouped_gemm=True, pp_rank=0
+    )
+    mova_expert_spec = (
+        block_spec.layer_specs[config.mova_num_dense_layers]
+        .submodules.mlp.submodules.experts
+    )
+
+    assert mova_expert_spec.module is TEGroupedMLP
+    assert mova_expert_spec.params["apply_router_probs_after_fc2"] is True
+
+    default_moe_spec = get_moe_module_spec_for_backend(
+        backend=TESpecProvider(), num_experts=config.num_moe_experts, moe_grouped_gemm=True
+    )
+    default_expert_spec = default_moe_spec.submodules.experts
+    assert default_expert_spec.module is TEGroupedMLP
+    assert "apply_router_probs_after_fc2" not in default_expert_spec.params
+
+
+class _FakeGroupedLinear(torch.nn.Module):
+    """Small deterministic grouped-linear stand-in for probability-placement tests."""
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.register_buffer("weight", weight)
+
+    def forward(self, hidden_states, _tokens_per_expert):
+        return torch.matmul(hidden_states, self.weight), None
+
+
+def _fake_te_grouped_mlp(
+    weight1: torch.Tensor, weight2: torch.Tensor, *, apply_router_probs_after_fc2: bool
+) -> TEGroupedMLP:
+    experts = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    experts.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_apply_probs_on_input=False,
+        use_te_activation_func=False,
+        bias_activation_fusion=False,
+        gated_linear_unit=False,
+    )
+    experts.num_local_experts = 1
+    experts.apply_router_probs_after_fc2 = apply_router_probs_after_fc2
+    experts.activation_func = F.silu
+    experts.linear_fc1 = _FakeGroupedLinear(weight1)
+    experts.linear_fc2 = _FakeGroupedLinear(weight2)
+    experts.activation_recompute = False
+    experts.offload_expert_fc1 = False
+    experts.offload_moe_act = False
+    return experts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_mova_post_fc2_router_probs_match_xllm_bf16_contract_and_preserve_dtype():
+    torch.manual_seed(20260814)
+    hidden_states = torch.randn(11, 8, device="cuda", dtype=torch.bfloat16)
+    weight1 = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+    weight2 = torch.randn(64, 8, device="cuda", dtype=torch.bfloat16)
+    routing_probs = torch.tensor(
+        [0.113, 0.227, 0.349, 0.461, 0.587, 0.613, 0.739, 0.811, 0.887, 0.941, 1.127],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    tokens_per_expert = torch.tensor([hidden_states.shape[0]], device="cuda")
+
+    fc1_output = torch.matmul(hidden_states, weight1)
+    activated = F.silu(fc1_output)
+    unweighted_down = torch.matmul(activated, weight2)
+    post_fc2_reference = unweighted_down * routing_probs.to(unweighted_down.dtype).unsqueeze(-1)
+    pre_fc2_reference = torch.matmul(
+        (activated * routing_probs.unsqueeze(-1)).to(activated.dtype), weight2
+    )
+
+    post_fc2_experts = _fake_te_grouped_mlp(
+        weight1, weight2, apply_router_probs_after_fc2=True
+    )
+    post_fc2_output, post_fc2_bias = post_fc2_experts(
+        hidden_states, tokens_per_expert, routing_probs
+    )
+    assert post_fc2_bias is None
+    assert post_fc2_output.dtype == torch.bfloat16
+    torch.testing.assert_close(post_fc2_output, post_fc2_reference, rtol=0.0, atol=0.0)
+
+    default_experts = _fake_te_grouped_mlp(
+        weight1, weight2, apply_router_probs_after_fc2=False
+    )
+    default_output, default_bias = default_experts(
+        hidden_states, tokens_per_expert, routing_probs
+    )
+    assert default_bias is None
+    assert default_output.dtype == torch.bfloat16
+    torch.testing.assert_close(default_output, pre_fc2_reference, rtol=0.0, atol=0.0)
+    assert not torch.equal(post_fc2_output, default_output)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -14,6 +14,7 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.mova import (
     GroupedGemmMoVAValueExperts,
     GroupRMSNorm,
@@ -108,6 +109,11 @@ def _get_mova_layer_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
+    if mlp.submodules.experts.module is TEGroupedMLP:
+        # Native xLLM, HF, and SGLang weight the completed expert down
+        # projection. Restrict that numerical contract to the production MoVA
+        # TE grouped-expert path; other MoE specifications keep their default.
+        mlp.submodules.experts.params["apply_router_probs_after_fc2"] = True
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
