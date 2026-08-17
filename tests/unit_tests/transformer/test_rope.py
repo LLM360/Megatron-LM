@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.extensions import transformer_engine as transformer_engine_extensions
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -10,6 +11,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -19,6 +21,21 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.skipif(
+    not hasattr(transformer_engine_extensions, "fused_apply_rotary_pos_emb_thd"),
+    reason="Fused THD RoPE not available",
+)
+def test_packed_fused_interleaved_rejects_unsupported_te(monkeypatch):
+    monkeypatch.setattr(
+        transformer_engine_extensions, "is_te_min_version", lambda *_args, **_kwargs: False
+    )
+
+    with pytest.raises(ValueError, match="Only TE >= 2.3.0 supports interleaved fused RoPE"):
+        transformer_engine_extensions.fused_apply_rotary_pos_emb_thd(
+            None, None, None, interleaved=True
+        )
 
 
 class TestMultimodalRotaryEmbedding:
@@ -150,3 +167,32 @@ class TestQKVRotaryEmbedding:
         ), f"Output sizes do not match for K: {k_out.shape} != {k_out_ref.shape}"
         assert torch.allclose(q_out_ref, q_out), f"Outputs do not match for Q"
         assert torch.allclose(k_out_ref, k_out), f"Outputs do not match for K"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not is_te_min_version("2.3.0"), reason="Interleaved fused RoPE requires TE >= 2.3.0"
+    )
+    @pytest.mark.parametrize("rotary_interleaved", [False, True])
+    def test_packed_fused_gpu_forward(self, rotary_interleaved):
+        cu_seqlens = torch.tensor([0, 5, 12], dtype=torch.int32, device="cuda")
+        rotary_pos_emb = RotaryEmbedding(
+            self.kv_channels,
+            self.rotary_percent,
+            rotary_interleaved=rotary_interleaved,
+            use_cpu_initialization=False,
+        )
+        freqs = rotary_pos_emb(7, packed_seq=True)
+        t = torch.randn(
+            12, self.num_heads, self.kv_channels, dtype=torch.bfloat16, device="cuda"
+        )
+
+        self.transformer_config.rotary_interleaved = rotary_interleaved
+        self.transformer_config.apply_rope_fusion = False
+        expected = apply_rotary_pos_emb(
+            t.float(), freqs, self.transformer_config, cu_seqlens=cu_seqlens
+        ).to(t.dtype)
+
+        self.transformer_config.apply_rope_fusion = True
+        actual = apply_rotary_pos_emb(t, freqs, self.transformer_config, cu_seqlens=cu_seqlens)
+
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
