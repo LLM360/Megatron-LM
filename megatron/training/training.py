@@ -323,6 +323,68 @@ def num_floating_point_operations(args, batch_size):
         # Group Query Attention.
         if not args.group_query_attention:
             args.num_query_groups = args.num_attention_heads
+        if getattr(args, 'mova_num_value_experts', 0) > 0:
+            if args.mtp_num_layers is not None:
+                raise ValueError("MoVA FLOP accounting does not support MTP layers")
+            num_dense_layers = args.mova_num_dense_layers
+            num_mova_layers = args.num_layers - num_dense_layers
+            if not 0 <= num_dense_layers < args.num_layers:
+                raise ValueError("MoVA requires a valid dense prefix and sparse layers")
+
+            query_size = args.kv_channels * args.num_attention_heads
+            key_value_size = args.kv_channels * args.num_query_groups
+            gate_size = query_size if args.attention_output_gate else 0
+            # Each GEMM contributes 2 FLOPs per FMA and runs in forward,
+            # backward-dgrad, and backward-wgrad (6x total).
+            dense_attention = 6 * (
+                args.hidden_size
+                * (2 * query_size + 2 * key_value_size + gate_size)
+                + query_size * args.seq_length
+            )
+            mova_attention = 6 * (
+                args.hidden_size
+                * (
+                    2 * query_size
+                    + key_value_size
+                    + gate_size
+                    + args.mova_router_topk * key_value_size
+                    + args.mova_num_value_experts
+                )
+                + query_size * args.seq_length
+            )
+
+            gated_multiplier = 3 / 2 if args.swiglu else 1
+            dense_mlp = (
+                12
+                * args.hidden_size
+                * args.ffn_hidden_size
+                * gated_multiplier
+            )
+            shared_expert_size = args.moe_shared_expert_intermediate_size or 0
+            moe_ffn_hidden_size = (
+                args.moe_ffn_hidden_size
+                if args.moe_ffn_hidden_size is not None
+                else args.ffn_hidden_size
+            )
+            sparse_mlp = (
+                12
+                * args.hidden_size
+                * gated_multiplier
+                * (
+                    moe_ffn_hidden_size * args.moe_router_topk
+                    + shared_expert_size
+                )
+            )
+            logits = 6 * args.hidden_size * args.padded_vocab_size
+            return (
+                batch_size
+                * args.seq_length
+                * (
+                    num_dense_layers * (dense_attention + dense_mlp)
+                    + num_mova_layers * (mova_attention + sparse_mlp)
+                    + logits
+                )
+            )
         # MoE.
         if args.num_experts is None:
             # Every Transformer MLP is dense.

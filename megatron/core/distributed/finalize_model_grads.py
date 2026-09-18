@@ -281,7 +281,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if (
+                hasattr(module, 'expert_bias')
+                and module.expert_bias is not None
+                and hasattr(module, 'local_tokens_per_expert')
+            ):
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -295,24 +299,39 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
     """
-    tokens_per_expert_list = []
-    expert_bias_list = []
+    # Routers can differ in expert count and update rate (for example, MoVA's
+    # value router and the feed-forward MoE router). Group compatible routers
+    # instead of assuming every router can be stacked together.
+    router_groups = {}
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if hasattr(module, 'expert_bias'):
-                tokens_per_expert_list.append(module.local_tokens_per_expert)
-                expert_bias_list.append(module.expert_bias)
-    # For hybrid models with both MoE and Dense layers, this list can be empty.
-    if len(expert_bias_list) == 0:
-        return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
-    )
+            if (
+                not hasattr(module, 'expert_bias')
+                or module.expert_bias is None
+                or not hasattr(module, 'local_tokens_per_expert')
+            ):
+                continue
+            update_rate = getattr(
+                module, 'expert_bias_update_rate', config.moe_router_bias_update_rate
+            )
+            group_key = (module.expert_bias.numel(), update_rate)
+            router_groups.setdefault(group_key, []).append(module)
 
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    # For hybrid models with both MoE and Dense layers, this list can be empty.
+    if len(router_groups) == 0:
+        return
+
+    for (_, update_rate), routers in router_groups.items():
+        stacked_tokens_per_expert = torch.stack(
+            [router.local_tokens_per_expert for router in routers], dim=0
+        )
+        stacked_expert_bias = torch.stack([router.expert_bias for router in routers], dim=0)
+        stacked_updated_expert_bias = get_updated_expert_bias(
+            stacked_tokens_per_expert, stacked_expert_bias, update_rate
+        )
+
+        for router, updated_expert_bias in zip(routers, stacked_updated_expert_bias):
+            router.expert_bias.copy_(updated_expert_bias)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -473,7 +492,9 @@ def finalize_model_grads(
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 
-    if config.moe_router_enable_expert_bias:
+    if config.moe_router_enable_expert_bias or getattr(
+        config, 'mova_router_enable_expert_bias', False
+    ):
         _update_router_expert_bias(model, config)
 
     reset_model_temporary_tensors(config, model)

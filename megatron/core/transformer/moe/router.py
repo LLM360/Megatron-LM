@@ -92,7 +92,37 @@ class Router(ABC, MegatronModule):
         if self.bias is not None and self.bias.device.type == 'cpu':
             self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
 
-        # Convert to specified datatype for routing computation if enabled
+        # xLLM performs the router GEMM in the activation dtype, rounds its
+        # output there, and only then converts logits to FP32 for scoring and
+        # top-k. Preserve that ordering for MoVA checkpoint continuation; a
+        # direct FP32 GEMM can change discrete expert choices near ties.
+        if getattr(self.config, 'xllm_router_compatibility', False):
+            if self.config.moe_router_dtype == 'fp64':
+                raise ValueError("xLLM router compatibility does not support fp64 routing")
+            partitions = getattr(self.config, 'xllm_router_gemm_partitions', 1)
+            if partitions == 1:
+                logits = router_gating_linear(input, self.weight, self.bias, input.dtype)
+                return logits.float()
+            if self.bias is not None:
+                raise ValueError("Partitioned xLLM router compatibility requires no linear bias")
+            if input.shape[-1] % partitions or self.weight.shape[-1] % partitions:
+                raise ValueError("Router hidden size must be divisible by GEMM partitions")
+
+            # xLLM row-shards each router over model parallel ranks. Every
+            # partial GEMM is rounded to BF16, converted to FP32, and then
+            # summed. Emulate that numerical contract locally so checkpoint
+            # continuation is independent of Megatron's target TP topology.
+            logits = None
+            for input_part, weight_part in zip(
+                input.chunk(partitions, dim=-1), self.weight.chunk(partitions, dim=-1)
+            ):
+                partial = router_gating_linear(
+                    input_part.contiguous(), weight_part.contiguous(), None, input.dtype
+                ).float()
+                logits = partial if logits is None else logits + partial
+            return logits
+
+        # Convert to specified datatype for routing computation if enabled.
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
             router_dtype = torch.float32
@@ -161,6 +191,9 @@ class TopKRouter(Router):
         self.input_jitter = None
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        # Keep this on the router itself. Hybrid architectures may contain
+        # routers with different expert counts and update rates.
+        self.expert_bias_update_rate = self.config.moe_router_bias_update_rate
         if self.enable_expert_bias:
             self.register_buffer(
                 'local_tokens_per_expert',
@@ -283,11 +316,15 @@ class TopKRouter(Router):
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
-
+        # xLLM computes this objective independently on each context
+        # partition while still combining sequence-parallel token statistics
+        # across TP. Standard MCore retains the TP+CP objective.
+        xllm_compatibility = getattr(self.config, 'xllm_router_compatibility', False)
+        aux_loss_group = self.tp_group if xllm_compatibility else self.tp_cp_group
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
+                reduce_group=aux_loss_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -308,8 +345,9 @@ class TopKRouter(Router):
             aux_loss_coeff,
             aux_loss,
             "load_balancing_loss",
-            self.tp_cp_group,
+            aux_loss_group,
             valid_token_count=local_num_tokens,
+            avg_group=self.cp_group if xllm_compatibility else None,
         )
         return probs
 
@@ -423,6 +461,7 @@ class TopKRouter(Router):
         reduce_group: torch.distributed.ProcessGroup,
         reduce_group_has_dp: bool = False,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -453,6 +492,7 @@ class TopKRouter(Router):
             num_layers,
             reduce_group=reduce_group,
             reduce_group_has_dp=reduce_group_has_dp,
+            avg_group=avg_group,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -605,6 +645,12 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
+            if getattr(self.config, 'xllm_router_compatibility', False):
+                # xLLM normalizes unbiased scores for its dot-product auxiliary
+                # loss, but counts the actual choices made with the loss-free
+                # selection bias. Keep standard MCore behavior unchanged for
+                # models that do not opt into xLLM checkpoint compatibility.
+                routing_map_for_aux_loss = routing_map
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,
